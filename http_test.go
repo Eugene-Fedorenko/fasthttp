@@ -92,7 +92,7 @@ func TestResponseBodyStreamDeflate(t *testing.T) {
 
 	body := createFixedBody(1e5)
 
-	// Verifies https://github.com/valyala/fasthttp/issues/176
+	// Verifies https://github.com/eugene-fedorenko/fasthttp/issues/176
 	// when Content-Length is explicitly set.
 	testResponseBodyStreamDeflate(t, body, len(body))
 
@@ -105,7 +105,7 @@ func TestResponseBodyStreamGzip(t *testing.T) {
 
 	body := createFixedBody(1e5)
 
-	// Verifies https://github.com/valyala/fasthttp/issues/176
+	// Verifies https://github.com/eugene-fedorenko/fasthttp/issues/176
 	// when Content-Length is explicitly set.
 	testResponseBodyStreamGzip(t, body, len(body))
 

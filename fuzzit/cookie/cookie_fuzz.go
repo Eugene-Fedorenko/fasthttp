@@ -5,7 +5,7 @@ package fuzzit
 import (
 	"bytes"
 
-	"github.com/valyala/fasthttp"
+	"github.com/eugene-fedorenko/fasthttp"
 )
 
 func Fuzz(data []byte) int {

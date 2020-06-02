@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
-	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -125,6 +123,10 @@ type Resolver interface {
 	LookupIPAddr(context.Context, string) (names []net.IPAddr, err error)
 }
 
+type TCPResolver interface {
+	LookupTCPAddr(context.Context, string) (addrs []net.TCPAddr, err error)
+}
+
 // TCPDialer contains options to control a group of Dial calls.
 type TCPDialer struct {
 	// Concurrency controls the maximum number of concurrent Dails
@@ -151,10 +153,7 @@ type TCPDialer struct {
 	// 		},
 	// 	},
 	// }
-	Resolver Resolver
-
-	tcpAddrsLock sync.Mutex
-	tcpAddrsMap  map[string]*tcpAddrEntry
+	Resolver TCPResolver
 
 	concurrencyCh chan struct{}
 
@@ -272,33 +271,47 @@ func (d *TCPDialer) dial(addr string, dualStack bool, timeout time.Duration) (ne
 		if d.Concurrency > 0 {
 			d.concurrencyCh = make(chan struct{}, d.Concurrency)
 		}
-		d.tcpAddrsMap = make(map[string]*tcpAddrEntry)
-		go d.tcpAddrsClean()
 	})
 
-	addrs, idx, err := d.getTCPAddrs(addr, dualStack)
+	resolver := d.Resolver
+	if resolver == nil {
+		resolver = defaultTCPResolver
+	}
+
+	addrs, err := resolver.LookupTCPAddr(context.Background(), addr)
 	if err != nil {
 		return nil, err
 	}
+
+	if len(addrs) == 0 {
+		return nil, errNoDNSEntries
+	}
+
 	network := "tcp4"
 	if dualStack {
 		network = "tcp"
 	}
 
 	var conn net.Conn
-	n := uint32(len(addrs))
 	deadline := time.Now().Add(timeout)
-	for n > 0 {
-		conn, err = d.tryDial(network, &addrs[idx%n], deadline, d.concurrencyCh)
+	for n := range addrs {
+		if !dualStack && addrs[n].IP.To4() == nil {
+			continue
+		}
+
+		conn, err = d.tryDial(network, &addrs[n], deadline, d.concurrencyCh)
 		if err == nil {
 			return conn, nil
 		}
 		if err == ErrDialTimeout {
 			return nil, err
 		}
-		idx++
-		n--
 	}
+
+	if err == nil {
+		err = errNoDNSEntries
+	}
+
 	return nil, err
 }
 
@@ -373,106 +386,6 @@ var ErrDialTimeout = errors.New("dialing to the given TCP address timed out")
 // for establishing TCP connections.
 const DefaultDialTimeout = 3 * time.Second
 
-type tcpAddrEntry struct {
-	addrs    []net.TCPAddr
-	addrsIdx uint32
-
-	resolveTime time.Time
-	pending     bool
-}
-
-// DefaultDNSCacheDuration is the duration for caching resolved TCP addresses
-// by Dial* functions.
-const DefaultDNSCacheDuration = time.Minute
-
-func (d *TCPDialer) tcpAddrsClean() {
-	expireDuration := 2 * DefaultDNSCacheDuration
-	for {
-		time.Sleep(time.Second)
-		t := time.Now()
-
-		d.tcpAddrsLock.Lock()
-		for k, e := range d.tcpAddrsMap {
-			if t.Sub(e.resolveTime) > expireDuration {
-				delete(d.tcpAddrsMap, k)
-			}
-		}
-		d.tcpAddrsLock.Unlock()
-	}
-}
-
-func (d *TCPDialer) getTCPAddrs(addr string, dualStack bool) ([]net.TCPAddr, uint32, error) {
-	d.tcpAddrsLock.Lock()
-	e := d.tcpAddrsMap[addr]
-	if e != nil && !e.pending && time.Since(e.resolveTime) > DefaultDNSCacheDuration {
-		e.pending = true
-		e = nil
-	}
-	d.tcpAddrsLock.Unlock()
-
-	if e == nil {
-		addrs, err := resolveTCPAddrs(addr, dualStack, d.Resolver)
-		if err != nil {
-			d.tcpAddrsLock.Lock()
-			e = d.tcpAddrsMap[addr]
-			if e != nil && e.pending {
-				e.pending = false
-			}
-			d.tcpAddrsLock.Unlock()
-			return nil, 0, err
-		}
-
-		e = &tcpAddrEntry{
-			addrs:       addrs,
-			resolveTime: time.Now(),
-		}
-
-		d.tcpAddrsLock.Lock()
-		d.tcpAddrsMap[addr] = e
-		d.tcpAddrsLock.Unlock()
-	}
-
-	idx := atomic.AddUint32(&e.addrsIdx, 1)
-	return e.addrs, idx, nil
-}
-
-func resolveTCPAddrs(addr string, dualStack bool, resolver Resolver) ([]net.TCPAddr, error) {
-	host, portS, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, err
-	}
-	port, err := strconv.Atoi(portS)
-	if err != nil {
-		return nil, err
-	}
-
-	if resolver == nil {
-		resolver = net.DefaultResolver
-	}
-
-	ctx := context.Background()
-	ipaddrs, err := resolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return nil, err
-	}
-
-	n := len(ipaddrs)
-	addrs := make([]net.TCPAddr, 0, n)
-	for i := 0; i < n; i++ {
-		ip := ipaddrs[i]
-		if !dualStack && ip.IP.To4() == nil {
-			continue
-		}
-		addrs = append(addrs, net.TCPAddr{
-			IP:   ip.IP,
-			Port: port,
-			Zone: ip.Zone,
-		})
-	}
-	if len(addrs) == 0 {
-		return nil, errNoDNSEntries
-	}
-	return addrs, nil
-}
-
 var errNoDNSEntries = errors.New("couldn't find DNS entries for the given domain. Try using DialDualStack")
+
+var defaultTCPResolver = NewTCPResolverCached(DefaultTCPResolverCacheTTL, true)
