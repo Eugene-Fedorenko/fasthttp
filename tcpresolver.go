@@ -147,6 +147,8 @@ func (r *TCPResolverCached) LookupTCPAddr(ctx context.Context, addr string) (add
 			r.updateQueue <- addr
 		}
 
+		addrs = addrItem.addrs
+
 		return
 	}
 
