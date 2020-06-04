@@ -111,7 +111,8 @@ func (r *TCPResolverCached) resolveTCPAddr(ctx context.Context, addr string) (er
 
 	addrItem.addrs = addrItem.addrs[:len(ipAddrs)]
 
-	for cacheItemNum, ipAddrNum := 0, 0; ipAddrNum < len(ipAddrs); ipAddrNum++ {
+	cacheItemNum := 0
+	for ipAddrNum := 0; ipAddrNum < len(ipAddrs); ipAddrNum++ {
 		if r.ipv4Only && ipAddrs[ipAddrNum].IP.To4() == nil {
 			continue
 		}
@@ -124,6 +125,8 @@ func (r *TCPResolverCached) resolveTCPAddr(ctx context.Context, addr string) (er
 
 		cacheItemNum++
 	}
+
+	addrItem.addrs = addrItem.addrs[:cacheItemNum]
 
 	return
 }
