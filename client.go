@@ -294,9 +294,11 @@ type Client struct {
 	// By default will use isIdempotent function
 	RetryIf RetryIfFunc
 
+	CreateHostClientFunc CreateHostClientFunc
+
 	mLock sync.Mutex
-	m     map[string]*HostClient
-	ms    map[string]*HostClient
+	m     map[string]ClientDoer
+	ms    map[string]ClientDoer
 }
 
 // Get returns the status code and body of url.
@@ -473,7 +475,7 @@ func (c *Client) Do(req *Request, resp *Response) error {
 		m = c.ms
 	}
 	if m == nil {
-		m = make(map[string]*HostClient)
+		m = make(map[string]ClientDoer)
 		if isTLS {
 			c.ms = m
 		} else {
@@ -482,30 +484,18 @@ func (c *Client) Do(req *Request, resp *Response) error {
 	}
 	hc := m[string(host)]
 	if hc == nil {
-		hc = &HostClient{
-			Addr:                          addMissingPort(string(host), isTLS),
-			Name:                          c.Name,
-			NoDefaultUserAgentHeader:      c.NoDefaultUserAgentHeader,
-			Dial:                          c.Dial,
-			DialDualStack:                 c.DialDualStack,
-			IsTLS:                         isTLS,
-			TLSConfig:                     c.TLSConfig,
-			MaxConns:                      c.MaxConnsPerHost,
-			MaxIdleConnDuration:           c.MaxIdleConnDuration,
-			MaxConnDuration:               c.MaxConnDuration,
-			MaxIdemponentCallAttempts:     c.MaxIdemponentCallAttempts,
-			ReadBufferSize:                c.ReadBufferSize,
-			WriteBufferSize:               c.WriteBufferSize,
-			ReadTimeout:                   c.ReadTimeout,
-			WriteTimeout:                  c.WriteTimeout,
-			MaxResponseBodySize:           c.MaxResponseBodySize,
-			DisableHeaderNamesNormalizing: c.DisableHeaderNamesNormalizing,
-			DisablePathNormalizing:        c.DisablePathNormalizing,
-			MaxConnWaitTimeout:            c.MaxConnWaitTimeout,
-			RetryIf:                       c.RetryIf,
+		if c.CreateHostClientFunc == nil {
+			c.CreateHostClientFunc = defaultCreateHostClient
 		}
+		var err error
+
+		hc, err = c.CreateHostClientFunc(c, string(host), isTLS)
+		if err != nil {
+			return err
+		}
+
 		m[string(host)] = hc
-		if len(m) == 1 {
+		if _, ok := hc.(*HostClient); ok && len(m) == 1 {
 			startCleaner = true
 		}
 	}
@@ -518,15 +508,15 @@ func (c *Client) Do(req *Request, resp *Response) error {
 	return hc.Do(req, resp)
 }
 
-func (c *Client) mCleaner(m map[string]*HostClient) {
+func (c *Client) mCleaner(m map[string]ClientDoer) {
 	mustStop := false
 
 	for {
 		c.mLock.Lock()
 		for k, v := range m {
-			v.connsLock.Lock()
-			shouldRemove := v.connsCount == 0
-			v.connsLock.Unlock()
+			v.(*HostClient).connsLock.Lock()
+			shouldRemove := v.(*HostClient).connsCount == 0
+			v.(*HostClient).connsLock.Unlock()
 
 			if shouldRemove {
 				delete(m, k)
@@ -804,11 +794,38 @@ func (c *HostClient) Post(dst []byte, url string, postArgs *Args) (statusCode in
 	return clientPostURL(dst, url, postArgs, c)
 }
 
-type clientDoer interface {
+type CreateHostClientFunc func(c *Client, addr string, isTLS bool) (ClientDoer, error)
+
+type ClientDoer interface {
 	Do(req *Request, resp *Response) error
 }
 
-func clientGetURL(dst []byte, url string, c clientDoer) (statusCode int, body []byte, err error) {
+func defaultCreateHostClient(c *Client, addr string, isTLS bool) (ClientDoer, error) {
+	return &HostClient{
+		Addr:                          addMissingPort(addr, isTLS),
+		Name:                          c.Name,
+		NoDefaultUserAgentHeader:      c.NoDefaultUserAgentHeader,
+		Dial:                          c.Dial,
+		DialDualStack:                 c.DialDualStack,
+		IsTLS:                         isTLS,
+		TLSConfig:                     c.TLSConfig,
+		MaxConns:                      c.MaxConnsPerHost,
+		MaxIdleConnDuration:           c.MaxIdleConnDuration,
+		MaxConnDuration:               c.MaxConnDuration,
+		MaxIdemponentCallAttempts:     c.MaxIdemponentCallAttempts,
+		ReadBufferSize:                c.ReadBufferSize,
+		WriteBufferSize:               c.WriteBufferSize,
+		ReadTimeout:                   c.ReadTimeout,
+		WriteTimeout:                  c.WriteTimeout,
+		MaxResponseBodySize:           c.MaxResponseBodySize,
+		DisableHeaderNamesNormalizing: c.DisableHeaderNamesNormalizing,
+		DisablePathNormalizing:        c.DisablePathNormalizing,
+		MaxConnWaitTimeout:            c.MaxConnWaitTimeout,
+		RetryIf:                       c.RetryIf,
+	}, nil
+}
+
+func clientGetURL(dst []byte, url string, c ClientDoer) (statusCode int, body []byte, err error) {
 	req := AcquireRequest()
 
 	statusCode, body, err = doRequestFollowRedirectsBuffer(req, dst, url, c)
@@ -817,7 +834,7 @@ func clientGetURL(dst []byte, url string, c clientDoer) (statusCode int, body []
 	return statusCode, body, err
 }
 
-func clientGetURLTimeout(dst []byte, url string, timeout time.Duration, c clientDoer) (statusCode int, body []byte, err error) {
+func clientGetURLTimeout(dst []byte, url string, timeout time.Duration, c ClientDoer) (statusCode int, body []byte, err error) {
 	deadline := time.Now().Add(timeout)
 	return clientGetURLDeadline(dst, url, deadline, c)
 }
@@ -828,7 +845,7 @@ type clientURLResponse struct {
 	err        error
 }
 
-func clientGetURLDeadline(dst []byte, url string, deadline time.Time, c clientDoer) (statusCode int, body []byte, err error) {
+func clientGetURLDeadline(dst []byte, url string, deadline time.Time, c ClientDoer) (statusCode int, body []byte, err error) {
 	timeout := -time.Since(deadline)
 	if timeout <= 0 {
 		return 0, dst, ErrTimeout
@@ -878,7 +895,7 @@ func clientGetURLDeadline(dst []byte, url string, deadline time.Time, c clientDo
 
 var clientURLResponseChPool sync.Pool
 
-func clientPostURL(dst []byte, url string, postArgs *Args, c clientDoer) (statusCode int, body []byte, err error) {
+func clientPostURL(dst []byte, url string, postArgs *Args, c ClientDoer) (statusCode int, body []byte, err error) {
 	req := AcquireRequest()
 	req.Header.SetMethodBytes(strPost)
 	req.Header.SetContentTypeBytes(strPostArgsContentType)
@@ -908,7 +925,7 @@ var (
 
 const defaultMaxRedirectsCount = 16
 
-func doRequestFollowRedirectsBuffer(req *Request, dst []byte, url string, c clientDoer) (statusCode int, body []byte, err error) {
+func doRequestFollowRedirectsBuffer(req *Request, dst []byte, url string, c ClientDoer) (statusCode int, body []byte, err error) {
 	resp := AcquireResponse()
 	bodyBuf := resp.bodyBuffer()
 	resp.keepBodyBuffer = true
@@ -925,7 +942,7 @@ func doRequestFollowRedirectsBuffer(req *Request, dst []byte, url string, c clie
 	return statusCode, body, err
 }
 
-func doRequestFollowRedirects(req *Request, resp *Response, url string, maxRedirectsCount int, c clientDoer) (statusCode int, body []byte, err error) {
+func doRequestFollowRedirects(req *Request, resp *Response, url string, maxRedirectsCount int, c ClientDoer) (statusCode int, body []byte, err error) {
 	redirectsCount := 0
 
 	for {
@@ -1098,12 +1115,12 @@ func (c *HostClient) DoRedirects(req *Request, resp *Response, maxRedirectsCount
 	return err
 }
 
-func clientDoTimeout(req *Request, resp *Response, timeout time.Duration, c clientDoer) error {
+func clientDoTimeout(req *Request, resp *Response, timeout time.Duration, c ClientDoer) error {
 	deadline := time.Now().Add(timeout)
 	return clientDoDeadline(req, resp, deadline, c)
 }
 
-func clientDoDeadline(req *Request, resp *Response, deadline time.Time, c clientDoer) error {
+func clientDoDeadline(req *Request, resp *Response, deadline time.Time, c ClientDoer) error {
 	timeout := -time.Since(deadline)
 	if timeout <= 0 {
 		return ErrTimeout
